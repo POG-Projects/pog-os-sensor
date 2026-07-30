@@ -1,0 +1,279 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      bumped: ${{ steps.version.outputs.bumped }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine version before build
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(tr -d '[:space:]' < version.txt)
+          BUMPED=false
+
+          if gh release view "v$VERSION" > /dev/null 2>&1; then
+            echo "Release v$VERSION already exists, auto-incrementing..."
+            LATEST_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName')
+            LATEST_VERSION=${LATEST_TAG#v}
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_VERSION"
+            VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            BUMPED=true
+            echo "New version: $VERSION"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid semantic version: $VERSION" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "bumped=$BUMPED" >> "$GITHUB_OUTPUT"
+
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compile and run sampling policy tests
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -I include \
+            test_host/test_sampling_policy.cpp -o /tmp/pog-sensor-test
+          /tmp/pog-sensor-test
+
+  build:
+    needs: [prepare, host-tests]
+    runs-on: ubuntu-latest
+    env:
+      POGSENSOR_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: esp32c3
+            env: esp32c3
+            chip: esp32c3
+            flash_size: "4MB"
+            label: "ESP32-C3 SuperMini (4 Mo)"
+          - name: esp32s3
+            env: esp32s3
+            chip: esp32s3
+            flash_size: "8MB"
+            label: "ESP32-S3 DevKitC-1 (8 Mo)"
+          - name: esp32dev
+            env: esp32dev
+            chip: esp32
+            flash_size: "4MB"
+            label: "ESP32 DevKit (4 Mo)"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build ${{ matrix.name }}
+        run: |
+          pio run -e "${{ matrix.env }}"
+          mkdir -p dist
+          cp ".pio/build/${{ matrix.env }}/firmware.bin" \
+            "dist/firmware-${{ matrix.name }}.bin"
+          cp ".pio/build/${{ matrix.env }}/firmware.factory.bin" \
+            "dist/merged-${{ matrix.name }}.bin"
+
+      - name: Validate embedded firmware version
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          version = os.environ["POGSENSOR_BUILD_VERSION"]
+          path = "dist/firmware-${{ matrix.name }}.bin"
+          marker = f"POGSensor/{version}".encode()
+          if marker not in open(path, "rb").read():
+              sys.exit(f"{path}: missing embedded version {version}")
+          print(f"{path}: embedded version {version} verified")
+          PY
+
+      - name: Write manifest fragment
+        run: |
+          APP="dist/firmware-${{ matrix.name }}.bin"
+          MERGED="dist/merged-${{ matrix.name }}.bin"
+          APP_SHA=$(sha256sum "$APP" | cut -d" " -f1)
+          MERGED_SHA=$(sha256sum "$MERGED" | cut -d" " -f1)
+          MERGED_SIZE=$(stat -c%s "$MERGED")
+
+          cat > "dist/manifest-${{ matrix.name }}.json" <<EOF
+          {
+            "env": "${{ matrix.env }}",
+            "label": "${{ matrix.label }}",
+            "chip": "${{ matrix.chip }}",
+            "flashSize": "${{ matrix.flash_size }}",
+            "app": "firmware-${{ matrix.name }}.bin",
+            "appSha256": "${APP_SHA}",
+            "merged": "merged-${{ matrix.name }}.bin",
+            "mergedSha256": "${MERGED_SHA}",
+            "mergedSize": ${MERGED_SIZE}
+          }
+          EOF
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: firmware-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: firmware-*
+          merge-multiple: true
+
+      - name: Assemble manifest.json
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          {
+            echo "{"
+            echo "  \"version\": \"${VERSION}\","
+            echo "  \"boards\": ["
+            FIRST=1
+            for f in $(find dist -maxdepth 1 -name 'manifest-*.json' | sort); do
+              if [ "$FIRST" -eq 0 ]; then echo "    ,"; fi
+              sed 's/^/    /' "$f"
+              FIRST=0
+            done
+            echo "  ]"
+            echo "}"
+          } > dist/manifest.json
+          rm -f dist/manifest-*.json
+          cat dist/manifest.json
+
+      - name: Validate release
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          with open("dist/manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+", manifest.get("version", "")):
+              sys.exit("manifest.json: invalid semantic version")
+
+          boards = manifest.get("boards") or []
+          if not boards:
+              sys.exit("manifest.json declares no board")
+
+          seen = set()
+          for board in boards:
+              required = (
+                  "env", "label", "chip", "flashSize", "app", "appSha256",
+                  "merged", "mergedSha256", "mergedSize",
+              )
+              for key in required:
+                  if board.get(key) in (None, ""):
+                      sys.exit(f"board {board.get('env', '?')}: missing {key}")
+              if board["env"] in seen:
+                  sys.exit(f"duplicate env {board['env']}")
+              seen.add(board["env"])
+
+              for asset_key, hash_key in (
+                  ("app", "appSha256"),
+                  ("merged", "mergedSha256"),
+              ):
+                  path = os.path.join("dist", board[asset_key])
+                  if not os.path.isfile(path):
+                      sys.exit(f"board {board['env']}: absent asset {board[asset_key]}")
+                  digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+                  if digest != board[hash_key]:
+                      sys.exit(f"board {board['env']}: invalid {hash_key}")
+
+              merged_size = os.path.getsize(os.path.join("dist", board["merged"]))
+              if board["mergedSize"] != merged_size:
+                  sys.exit(
+                      f"board {board['env']}: mergedSize "
+                      f"{board['mergedSize']} != {merged_size}"
+                  )
+
+          print(f"manifest.json: {len(boards)} board(s), every asset verified")
+          PY
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum *.bin manifest.json > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Update version.txt
+        if: needs.prepare.outputs.bumped == 'true'
+        run: |
+          echo "${{ needs.prepare.outputs.version }}" > version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.txt
+          git commit -m "Bump version to ${{ needs.prepare.outputs.version }} [skip ci]"
+          git push
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: v${{ needs.prepare.outputs.version }}
+          files: |
+            dist/*.bin
+            dist/manifest.json
+            dist/SHA256SUMS
+          make_latest: true
+          generate_release_notes: true

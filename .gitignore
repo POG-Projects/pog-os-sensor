@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+sdkconfig*
+*.bin
+*.elf
+.DS_Store
