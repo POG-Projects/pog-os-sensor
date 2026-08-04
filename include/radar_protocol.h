@@ -59,7 +59,7 @@ inline bool parseLd2410(const uint8_t *frame, size_t size, Presence &presence) {
   if (size < 23 || frame[0] != 0xF4 || frame[1] != 0xF3 ||
       frame[2] != 0xF2 || frame[3] != 0xF1) return false;
   uint16_t payloadSize = littleU16(frame + 4);
-  if (payloadSize < 13 || size != 4 + 2 + payloadSize + 4) return false;
+  if (payloadSize < 13 || size != size_t{4 + 2 + 4} + payloadSize) return false;
   const uint8_t *footer = frame + size - 4;
   if (footer[0] != 0xF8 || footer[1] != 0xF7 || footer[2] != 0xF6 ||
       footer[3] != 0xF5) return false;
