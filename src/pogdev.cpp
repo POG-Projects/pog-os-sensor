@@ -12,6 +12,8 @@
 
 #include "config.h"
 #include "environment_sensor.h"
+#include "presence_light.h"
+#include "radar_sensor.h"
 
 #ifndef POGSENSOR_FW_VERSION
 #define POGSENSOR_FW_VERSION "dev"
@@ -49,6 +51,15 @@ uint32_t nextFullState = 0;
 uint32_t enrolmentStarted = 0;
 uint32_t nextRediscovery = 0;
 bool refreshAnnouncement = true;
+RadarReading currentRadar;
+bool hasRadarReading = false;
+bool manifestDirty = false;
+
+String deviceModel() {
+  String result = String("POG Sensor · ") + environmentSensorModel();
+  if (radarSensorPresent()) result += String(" + ") + radarSensorModel();
+  return result;
+}
 
 String makeHardwareId() {
   uint8_t mac[6] = {};
@@ -187,7 +198,7 @@ bool announceAndCollect(bool announce) {
   if (announce) {
     JsonDocument request;
     request["hw_id"] = hardwareId;
-    request["model"] = String("POG Sensor · ") + environmentSensorModel();
+    request["model"] = deviceModel();
     request["fw_version"] = POGSENSOR_FW_VERSION;
     request["proto_version"] = "1";
     request["name"] = g_config.name;
@@ -234,19 +245,100 @@ void addMeasurement(JsonArray entities, const char *key, const char *name,
   trait["config"]["read_only"] = true;
 }
 
+void addReadOnlyTraitEntity(JsonArray entities, const char *key,
+                            const char *name, const char *traitId,
+                            const char *category) {
+  JsonObject entity = entities.add<JsonObject>();
+  entity["key"] = key;
+  entity["name"] = name;
+  entity["category"] = category;
+  JsonObject trait = entity["traits"].to<JsonArray>().add<JsonObject>();
+  trait["id"] = traitId;
+  trait["config"]["read_only"] = true;
+}
+
+void addBinary(JsonArray entities, const char *key, const char *name,
+               const char *kind, const char *category = "presence") {
+  JsonObject entity = entities.add<JsonObject>();
+  entity["key"] = key;
+  entity["name"] = name;
+  entity["category"] = category;
+  JsonObject trait = entity["traits"].to<JsonArray>().add<JsonObject>();
+  trait["id"] = "binary";
+  trait["config"]["kind"] = kind;
+  trait["config"]["read_only"] = true;
+}
+
 void publishHello() {
   JsonDocument doc;
   doc["proto"] = 1;
   doc["hw_id"] = hardwareId;
-  doc["model"] = String("POG Sensor · ") + environmentSensorModel();
+  doc["model"] = deviceModel();
   doc["fw_version"] = POGSENSOR_FW_VERSION;
   doc["name"] = g_config.name;
   JsonArray entities = doc["entities"].to<JsonArray>();
-  addMeasurement(entities, "temperature", "Température", "temperature", "°C");
-  if (environmentSensorKind() == SensorKind::Bme280) {
+  if (environmentHasTemperature()) {
+    addMeasurement(entities, "temperature", "Température", "temperature", "°C");
+  }
+  if (environmentHasHumidity()) {
     addMeasurement(entities, "humidity", "Humidité", "humidity", "%");
   }
-  addMeasurement(entities, "pressure", "Pression", "pressure", "hPa");
+  if (environmentHasPressure()) {
+    addMeasurement(entities, "pressure", "Pression", "pressure", "hPa");
+  }
+  if (environmentHasCo2()) {
+    addMeasurement(entities, "co2", "CO₂", "co2", "ppm", "air_quality");
+  }
+  if (environmentHasIlluminance()) {
+    addMeasurement(entities, "illuminance", "Luminosité", "illuminance", "lx",
+                   "environment");
+  }
+  if (environmentHasVocIndex()) {
+    addMeasurement(entities, "voc_index", "Indice COV", "voc_index", "",
+                   "air_quality");
+  }
+  if (environmentHasGasResistance()) {
+    addMeasurement(entities, "gas_resistance", "Résistance gaz",
+                   "gas_resistance", "kΩ", "diagnostic");
+  }
+  if (radarSensorPresent()) {
+    addReadOnlyTraitEntity(entities, "presence", "Présence", "presence",
+                           "presence");
+    addBinary(entities, "motion", "Mouvement", "motion");
+    addReadOnlyTraitEntity(entities, "radar_tracking", "Suivi spatial",
+                           "radar_tracking", "presence");
+  }
+
+  if (g_config.statusLightInstalled) {
+    JsonObject light = entities.add<JsonObject>();
+    light["key"] = "presence_light";
+    light["name"] = "Lumière de présence";
+    light["category"] = "light";
+    JsonArray lightTraits = light["traits"].to<JsonArray>();
+    JsonObject lightPower = lightTraits.add<JsonObject>();
+    lightPower["id"] = "on_off";
+    lightPower["config"]["purpose"] = "nightlight";
+    lightPower["config"]["purpose_label"] = "Veilleuse";
+    lightTraits.add<JsonObject>()["id"] = "brightness";
+    lightTraits.add<JsonObject>()["id"] = "color";
+
+    JsonObject automatic = entities.add<JsonObject>();
+    automatic["key"] = "presence_light_auto";
+    automatic["name"] = "Allumage sur présence";
+    automatic["category"] = "light";
+    automatic["traits"].to<JsonArray>().add<JsonObject>()["id"] = "on_off";
+
+    JsonObject hold = entities.add<JsonObject>();
+    hold["key"] = "presence_light_hold";
+    hold["name"] = "Maintien après présence";
+    hold["category"] = "light";
+    JsonObject holdTrait = hold["traits"].to<JsonArray>().add<JsonObject>();
+    holdTrait["id"] = "number";
+    holdTrait["config"]["min"] = 0;
+    holdTrait["config"]["max"] = 300;
+    holdTrait["config"]["step"] = 1;
+    holdTrait["config"]["unit"] = "s";
+  }
   addMeasurement(entities, "wifi_signal", "Signal Wi-Fi", "signal_strength",
                  "dBm", "diagnostic");
 
@@ -273,17 +365,71 @@ void publishHello() {
 void publishState() {
   if (!hasReading) return;
   JsonDocument doc;
-  doc["temperature"]["value"] = roundf(currentReading.temperature * 10.0f) / 10.0f;
-  doc["temperature"]["kind"] = "temperature";
+  if (currentReading.hasTemperature) {
+    doc["temperature"]["value"] =
+        roundf(currentReading.temperature * 10.0f) / 10.0f;
+    doc["temperature"]["kind"] = "temperature";
+  }
   if (currentReading.hasHumidity) {
     doc["humidity"]["value"] = roundf(currentReading.humidity * 10.0f) / 10.0f;
     doc["humidity"]["kind"] = "humidity";
   }
-  doc["pressure"]["value"] = roundf(currentReading.pressure * 10.0f) / 10.0f;
-  doc["pressure"]["kind"] = "pressure";
+  if (currentReading.hasPressure) {
+    doc["pressure"]["value"] =
+        roundf(currentReading.pressure * 10.0f) / 10.0f;
+    doc["pressure"]["kind"] = "pressure";
+  }
+  if (currentReading.hasCo2) {
+    doc["co2"]["value"] = roundf(currentReading.co2);
+    doc["co2"]["kind"] = "co2";
+  }
+  if (currentReading.hasIlluminance) {
+    doc["illuminance"]["value"] =
+        roundf(currentReading.illuminance * 10.0f) / 10.0f;
+    doc["illuminance"]["kind"] = "illuminance";
+  }
+  if (currentReading.hasVocIndex) {
+    doc["voc_index"]["value"] = roundf(currentReading.vocIndex);
+    doc["voc_index"]["kind"] = "voc_index";
+  }
+  if (currentReading.hasGasResistance) {
+    doc["gas_resistance"]["value"] =
+        roundf(currentReading.gasResistance * 10.0f) / 10.0f;
+    doc["gas_resistance"]["kind"] = "gas_resistance";
+  }
+  if (hasRadarReading && radarSensorPresent()) {
+    doc["presence"]["occupied"] = currentRadar.occupied;
+    doc["presence"]["probability"] = currentRadar.occupied ? 1.0 : 0.0;
+    doc["motion"]["active"] = currentRadar.motion;
+    doc["motion"]["kind"] = "motion";
+    JsonObject tracking = doc["radar_tracking"].to<JsonObject>();
+    tracking["occupied"] = currentRadar.occupied;
+    tracking["target_count"] = currentRadar.targetCount;
+    tracking["moving_distance_m"] = currentRadar.movingDistanceCm / 100.0f;
+    tracking["stationary_distance_m"] =
+        currentRadar.stationaryDistanceCm / 100.0f;
+    tracking["nearest_distance_m"] =
+        currentRadar.detectionDistanceCm / 100.0f;
+    for (size_t i = 0; i < 3; ++i) {
+      const RadarTarget &target = currentRadar.targets[i];
+      String prefix = "target_" + String(i + 1) + "_";
+      tracking[prefix + "active"] = target.active;
+      if (!target.active) continue;
+      tracking[prefix + "x_m"] = target.xMm / 1000.0f;
+      tracking[prefix + "y_m"] = target.yMm / 1000.0f;
+      tracking[prefix + "speed_m_s"] = target.speedCmS / 100.0f;
+      tracking[prefix + "resolution_m"] = target.resolutionMm / 1000.0f;
+    }
+  }
+  if (g_config.statusLightInstalled) {
+    presenceLightFillState(doc["presence_light"].to<JsonObject>(),
+                           doc["presence_light_auto"].to<JsonObject>(),
+                           doc["presence_light_hold"].to<JsonObject>());
+  }
   doc["wifi_signal"]["value"] = currentReading.wifiRssi;
   doc["wifi_signal"]["kind"] = "signal_strength";
-  doc["sensor_status"]["active"] = currentReading.sensorOnline;
+  doc["sensor_status"]["active"] =
+      currentReading.sensorOnline || (hasRadarReading && currentRadar.online);
   doc["sensor_status"]["kind"] = "connectivity";
   String payload;
   serializeJson(doc, payload);
@@ -297,14 +443,68 @@ void publishState() {
 void handleCommand(char *, byte *payload, unsigned int length) {
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
-  Serial.printf("[PogHome] commande ignorée (capteur lecture seule): %s/%s\n",
-                doc["key"] | "?", doc["name"] | "?");
+  String key = doc["key"].as<String>();
+  String name = doc["name"].as<String>();
+  JsonObjectConst params = doc["params"].as<JsonObjectConst>();
+  bool changed = false;
+  bool persist = false;
+
+  if (!g_config.statusLightInstalled && key.startsWith("presence_light")) {
+    Serial.println("[PogHome] commande LED refusée: module non installé");
+    return;
+  }
+  if (key == "presence_light") {
+    if (name == "turn_on") {
+      presenceLightTurnOn();
+      changed = true;
+    } else if (name == "turn_off") {
+      presenceLightTurnOff();
+      changed = true;
+    } else if (name == "toggle") {
+      presenceLightToggle();
+      changed = true;
+    } else if (name == "set_brightness") {
+      presenceLightSetBrightness(params["brightness"] | 0.0f);
+      changed = persist = true;
+    } else if (name == "set_hs") {
+      presenceLightSetHs(params["hue"] | 0.0f,
+                         params["saturation"] | 0.0f);
+      changed = persist = true;
+    } else if (name == "set_color_temp") {
+      presenceLightSetColorTemperature(params["kelvin"] | 2700.0f);
+      changed = persist = true;
+    }
+  } else if (key == "presence_light_auto") {
+    bool enabled = presenceLightAutomatic();
+    if (name == "turn_on") enabled = true;
+    else if (name == "turn_off") enabled = false;
+    else if (name == "toggle") enabled = !enabled;
+    else enabled = presenceLightAutomatic();
+    if (enabled != presenceLightAutomatic()) {
+      presenceLightSetAutomatic(enabled);
+      changed = persist = true;
+    }
+  } else if (key == "presence_light_hold" && name == "set_value") {
+    presenceLightSetHoldSeconds(params["value"] | 8.0f);
+    changed = persist = true;
+  }
+
+  if (!changed) {
+    Serial.printf("[PogHome] commande ignorée: %s/%s\n", key.c_str(),
+                  name.c_str());
+    return;
+  }
+  if (persist && !configSave()) {
+    Serial.println("[LED] impossible d’enregistrer le réglage");
+  }
+  stateDirty = true;
+  Serial.printf("[PogHome] lumière: %s/%s\n", key.c_str(), name.c_str());
 }
 
 bool connectMqtt() {
   mqtt.setServer(credentials.host.c_str(), credentials.port);
   mqtt.setCallback(handleCommand);
-  mqtt.setBufferSize(2048);
+  mqtt.setBufferSize(4096);
   mqtt.setKeepAlive(30);
   String statusTopic = "pog/" + credentials.deviceId + "/status";
   bool ok = mqtt.connect(credentials.deviceId.c_str(),
@@ -372,6 +572,10 @@ void pogdevLoop() {
     return;
   }
   mqtt.loop();
+  if (manifestDirty) {
+    publishHello();
+    manifestDirty = false;
+  }
   if (stateDirty || (int32_t)(now - nextFullState) >= 0) publishState();
 }
 
@@ -380,6 +584,15 @@ void pogdevSetReading(const pogsensor::Reading &reading, bool forcePublish) {
   hasReading = true;
   stateDirty = stateDirty || forcePublish;
 }
+
+void pogdevSetRadar(const RadarReading &reading, bool forcePublish) {
+  currentRadar = reading;
+  hasRadarReading = true;
+  stateDirty = stateDirty || forcePublish;
+}
+
+void pogdevRefreshManifest() { manifestDirty = true; }
+void pogdevRefreshState() { stateDirty = true; }
 
 const String &pogdevHardwareId() { return hardwareId; }
 bool pogdevIsAdopted() { return credentials.valid(); }

@@ -4,10 +4,16 @@
 
 #include "sampling_policy.h"
 
-enum class SensorKind { None, Bme280, Bmp280 };
-
 bool environmentSensorBegin();
+void environmentSensorLoop();
 bool environmentSensorRead(pogsensor::Reading &reading);
-SensorKind environmentSensorKind();
 const char *environmentSensorModel();
-uint8_t environmentSensorAddress();
+const char *environmentSensorAddresses();
+bool environmentSensorPresent();
+bool environmentHasTemperature();
+bool environmentHasHumidity();
+bool environmentHasPressure();
+bool environmentHasCo2();
+bool environmentHasIlluminance();
+bool environmentHasVocIndex();
+bool environmentHasGasResistance();
