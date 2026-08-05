@@ -457,3 +457,24 @@ void otaUpdateFillJson(JsonObject out) {
   }
   xSemaphoreGive(stateMutex);
 }
+
+OtaVisualState otaUpdateVisualState() {
+  if (!stateMutex) return OtaVisualState::Idle;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  Phase phase = state.phase;
+  xSemaphoreGive(stateMutex);
+  switch (phase) {
+    case Phase::Checking:
+      return OtaVisualState::Checking;
+    case Phase::Available:
+      return OtaVisualState::Available;
+    case Phase::Downloading:
+      return OtaVisualState::Downloading;
+    case Phase::Verifying:
+      return OtaVisualState::Verifying;
+    case Phase::Error:
+      return OtaVisualState::Error;
+    default:
+      return OtaVisualState::Idle;
+  }
+}

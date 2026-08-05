@@ -59,11 +59,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Compile and run sampling policy tests
+      - name: Compile and run host tests
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -I include \
             test_host/test_sampling_policy.cpp -o /tmp/pog-sensor-test
           /tmp/pog-sensor-test
+          c++ -std=c++17 -Wall -Wextra -Werror -I include \
+            test_host/test_radar_protocol.cpp -o /tmp/pog-radar-test
+          /tmp/pog-radar-test
+
+      - name: Validate embedded dashboard JavaScript
+        run: |
+          awk '/<script>/{flag=1;next}/<\/script>/{flag=0}flag' \
+            src/web_ui.h > /tmp/pog-sensor-dashboard.js
+          node --check /tmp/pog-sensor-dashboard.js
 
   build:
     needs: [prepare, host-tests]
