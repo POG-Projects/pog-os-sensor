@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include "radar_wiring.h"
+
 enum class RadarKind { None, Ld2410, Ld2450 };
 
 struct RadarTarget {
@@ -28,5 +30,8 @@ bool radarSensorLoop();
 const RadarReading &radarSensorReading();
 bool radarSensorPresent();
 const char *radarSensorModel();
+const char *radarSensorPortModel(size_t index);
+pogsensor::radar::WiringStatus radarSensorPortWiring(size_t index);
+const char *radarSensorWiringName(pogsensor::radar::WiringStatus status);
 bool radarSensorMateriallyChanged(const RadarReading &previous,
                                   const RadarReading &next);

@@ -12,6 +12,7 @@
 namespace {
 constexpr uint32_t kRadarBaud = 256000;
 constexpr uint32_t kOfflineAfterMs = 3000;
+constexpr uint32_t kWiringProbeMs = 450;
 HardwareSerial radarA(1);
 HardwareSerial radarB(POGSENSOR_RADAR_UART_B);
 
@@ -27,6 +28,9 @@ PortParser ports[] = {{&radarA}, {&radarB}};
 RadarReading reading;
 RadarReading readings[2];
 String model = "aucun radar UART";
+pogsensor::radar::WiringStatus wiring[2] = {
+    pogsensor::radar::WiringStatus::Unknown,
+    pogsensor::radar::WiringStatus::Unknown};
 
 void consume(PortParser &port, size_t count) {
   if (count >= port.size) {
@@ -165,18 +169,68 @@ void rebuildCombined() {
   }
   if (!model.length()) model = "aucun radar UART";
 }
+
+void preparePins(uint8_t rxPin, uint8_t txPin) {
+  pinMode(rxPin, INPUT);
+  pinMode(txPin, INPUT);
+}
+
+void beginReceiveOnly(size_t index, uint8_t pin, uint8_t configuredRx,
+                      uint8_t configuredTx) {
+  PortParser &port = ports[index];
+  port.serial->end();
+  preparePins(configuredRx, configuredTx);
+  port.size = 0;
+  port.kind = RadarKind::None;
+  port.lastFrame = 0;
+  port.serial->begin(kRadarBaud, SERIAL_8N1, pin, -1);
+}
+
+void probePorts(const bool enabled[2]) {
+  uint32_t until = millis() + kWiringProbeMs;
+  while ((int32_t)(millis() - until) < 0) {
+    for (size_t index = 0; index < 2; ++index) {
+      if (enabled[index]) poll(ports[index], readings[index]);
+    }
+    delay(2);
+  }
+}
 }  // namespace
 
 void radarSensorBegin() {
-  radarA.begin(kRadarBaud, SERIAL_8N1, g_config.radarARxPin,
-               g_config.radarATxPin);
-  radarB.begin(kRadarBaud, SERIAL_8N1, g_config.radarBRxPin,
-               g_config.radarBTxPin);
-  uint32_t until = millis() + 350;
-  while ((int32_t)(millis() - until) < 0) {
-    radarSensorLoop();
-    delay(2);
+  const uint8_t rxPins[2] = {g_config.radarARxPin, g_config.radarBRxPin};
+  const uint8_t txPins[2] = {g_config.radarATxPin, g_config.radarBTxPin};
+  const bool bothPorts[2] = {true, true};
+  for (size_t index = 0; index < 2; ++index) {
+    readings[index] = RadarReading{};
+    beginReceiveOnly(index, rxPins[index], rxPins[index], txPins[index]);
   }
+  probePorts(bothPorts);
+
+  bool detectedOnExpected[2] = {ports[0].kind != RadarKind::None,
+                                ports[1].kind != RadarKind::None};
+  bool probeAlternate[2] = {!detectedOnExpected[0], !detectedOnExpected[1]};
+  for (size_t index = 0; index < 2; ++index) {
+    if (!probeAlternate[index]) continue;
+    readings[index] = RadarReading{};
+    beginReceiveOnly(index, txPins[index], rxPins[index], txPins[index]);
+  }
+  probePorts(probeAlternate);
+
+  for (size_t index = 0; index < 2; ++index) {
+    bool detectedOnAlternate =
+        probeAlternate[index] && ports[index].kind != RadarKind::None;
+    wiring[index] = pogsensor::radar::classifyWiring(
+        detectedOnExpected[index], detectedOnAlternate);
+    uint8_t activeRx = wiring[index] == pogsensor::radar::WiringStatus::Reversed
+                           ? txPins[index]
+                           : rxPins[index];
+    RadarKind detectedKind = ports[index].kind;
+    beginReceiveOnly(index, activeRx, rxPins[index], txPins[index]);
+    ports[index].kind = detectedKind;
+    ports[index].lastFrame = millis();
+  }
+  rebuildCombined();
 }
 
 bool radarSensorLoop() {
@@ -192,6 +246,30 @@ bool radarSensorPresent() {
   return ports[0].kind != RadarKind::None || ports[1].kind != RadarKind::None;
 }
 const char *radarSensorModel() { return model.c_str(); }
+
+const char *radarSensorPortModel(size_t index) {
+  if (index >= 2) return "inconnu";
+  if (ports[index].kind == RadarKind::Ld2410) return "LD2410B";
+  if (ports[index].kind == RadarKind::Ld2450) return "LD2450";
+  return "aucun radar";
+}
+
+pogsensor::radar::WiringStatus radarSensorPortWiring(size_t index) {
+  return index < 2 ? wiring[index] : pogsensor::radar::WiringStatus::Unknown;
+}
+
+const char *radarSensorWiringName(pogsensor::radar::WiringStatus status) {
+  switch (status) {
+    case pogsensor::radar::WiringStatus::Correct:
+      return "correct";
+    case pogsensor::radar::WiringStatus::Reversed:
+      return "RX/TX inversés (réception corrigée en logiciel)";
+    case pogsensor::radar::WiringStatus::NoSignal:
+      return "aucun signal valide";
+    default:
+      return "non testé";
+  }
+}
 
 bool radarSensorMateriallyChanged(const RadarReading &previous,
                                   const RadarReading &next) {

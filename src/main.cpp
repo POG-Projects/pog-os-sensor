@@ -185,11 +185,15 @@ void setup() {
   radarSensorBegin();
   presenceLightBegin();
   radarWasPresent = radarSensorPresent();
+  Serial.printf("[Radar] port A: %s · %s · broches RX/TX %u/%u\n",
+                radarSensorPortModel(0),
+                radarSensorWiringName(radarSensorPortWiring(0)),
+                g_config.radarARxPin, g_config.radarATxPin);
+  Serial.printf("[Radar] port B: %s · %s · broches RX/TX %u/%u\n",
+                radarSensorPortModel(1),
+                radarSensorWiringName(radarSensorPortWiring(1)),
+                g_config.radarBRxPin, g_config.radarBTxPin);
   if (radarWasPresent) {
-    Serial.printf("[Radar] %s, ports RX/TX %u/%u et %u/%u\n",
-                  radarSensorModel(), g_config.radarARxPin,
-                  g_config.radarATxPin, g_config.radarBRxPin,
-                  g_config.radarBTxPin);
     pogdevSetRadar(radarSensorReading(), true);
   }
   pogdevBegin();

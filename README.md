@@ -76,6 +76,11 @@ Les deux radars peuvent fonctionner simultanément grâce aux deux UART
 matériels. Ils utilisent 256000 bauds par défaut et sont reconnus d’après leurs
 trames, indépendamment du connecteur choisi.
 
+Au démarrage, le firmware écoute successivement les deux broches de chaque
+connecteur en haute impédance. Si les trames valides arrivent sur la broche TX
+déclarée, il signale une inversion RX/TX et corrige automatiquement la réception
+en logiciel pour la session.
+
 | Signal | Module | ESP32-C3 |
 |---|---|---|
 | Radar A TX | TX | GPIO 3 (RX ESP) |

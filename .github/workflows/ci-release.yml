@@ -61,12 +61,12 @@ jobs:
 
       - name: Compile and run host tests
         run: |
-          c++ -std=c++17 -Wall -Wextra -Werror -I include \
-            test_host/test_sampling_policy.cpp -o /tmp/pog-sensor-test
-          /tmp/pog-sensor-test
-          c++ -std=c++17 -Wall -Wextra -Werror -I include \
-            test_host/test_radar_protocol.cpp -o /tmp/pog-radar-test
-          /tmp/pog-radar-test
+          for source in test_host/*.cpp; do
+            binary="/tmp/$(basename "${source%.cpp}")"
+            c++ -std=c++17 -Wall -Wextra -Werror -I include \
+              "$source" -o "$binary"
+            "$binary"
+          done
 
       - name: Validate embedded dashboard JavaScript
         run: |

@@ -78,6 +78,12 @@ elles : chaque radar possède son propre RX côté ESP32.
 Les connecteurs A et B ne sont pas réservés à un modèle. Le firmware reconnaît
 automatiquement LD2410B ou LD2450 d’après les trames reçues.
 
+Au démarrage, le firmware écoute d’abord le RX attendu, puis la broche TX sans
+jamais la piloter pendant le test. Une trame LD2410/LD2450 valide sur la seconde
+broche produit le diagnostic `RX/TX inversés` et la réception est compensée en
+logiciel. L’absence de trame sur les deux broches reste indéterminée : vérifier
+alors le 5 V, la masse commune, le câblage et le débit du radar.
+
 ## Lampe témoin — quatre WS2812B
 
 | Segment WS2812B | ESP32-C3 |
