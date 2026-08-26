@@ -8,11 +8,26 @@
 #ifndef POGSENSOR_RADAR_UART_B
 #define POGSENSOR_RADAR_UART_B 0
 #endif
+#ifndef POGSENSOR_RADAR_FULL_SCAN
+#define POGSENSOR_RADAR_FULL_SCAN 0
+#endif
+#ifndef POGSENSOR_RADAR_ACTIVE_PROBE
+#define POGSENSOR_RADAR_ACTIVE_PROBE 0
+#endif
+#ifndef POGSENSOR_RADAR_RX_PULLUP
+#define POGSENSOR_RADAR_RX_PULLUP 0
+#endif
+#ifndef POGSENSOR_RADAR_RX_INVERTED
+#define POGSENSOR_RADAR_RX_INVERTED 0
+#endif
 
 namespace {
 constexpr uint32_t kRadarBaud = 256000;
+constexpr uint32_t kAlternateRadarBauds[] = {230400, 115200, 57600,
+                                              38400,  19200,  9600};
 constexpr uint32_t kOfflineAfterMs = 3000;
 constexpr uint32_t kWiringProbeMs = 450;
+constexpr size_t kRawSampleSize = 16;
 HardwareSerial radarA(1);
 HardwareSerial radarB(POGSENSOR_RADAR_UART_B);
 
@@ -22,6 +37,15 @@ struct PortParser {
   size_t size = 0;
   RadarKind kind = RadarKind::None;
   uint32_t lastFrame = 0;
+  uint32_t rawBytes = 0;
+  uint8_t rawSample[kRawSampleSize] = {};
+  size_t rawSampleSize = 0;
+};
+
+struct ProbeStats {
+  uint32_t rawBytes = 0;
+  uint8_t sample[kRawSampleSize] = {};
+  size_t sampleSize = 0;
 };
 
 PortParser ports[] = {{&radarA}, {&radarB}};
@@ -31,6 +55,7 @@ String model = "aucun radar UART";
 pogsensor::radar::WiringStatus wiring[2] = {
     pogsensor::radar::WiringStatus::Unknown,
     pogsensor::radar::WiringStatus::Unknown};
+uint32_t activeBauds[2] = {kRadarBaud, kRadarBaud};
 
 void consume(PortParser &port, size_t count) {
   if (count >= port.size) {
@@ -117,7 +142,12 @@ bool parseLd2410(PortParser &port, RadarReading &out) {
 bool poll(PortParser &port, RadarReading &out) {
   while (port.serial->available()) {
     if (port.size == sizeof(port.data)) consume(port, 1);
-    port.data[port.size++] = port.serial->read();
+    uint8_t value = port.serial->read();
+    port.data[port.size++] = value;
+    ++port.rawBytes;
+    if (port.rawSampleSize < sizeof(port.rawSample)) {
+      port.rawSample[port.rawSampleSize++] = value;
+    }
   }
   bool changed = false;
   while (parseLd2450(port, out) || parseLd2410(port, out)) changed = true;
@@ -176,14 +206,43 @@ void preparePins(uint8_t rxPin, uint8_t txPin) {
 }
 
 void beginReceiveOnly(size_t index, uint8_t pin, uint8_t configuredRx,
-                      uint8_t configuredTx) {
+                      uint8_t configuredTx, uint32_t baud = kRadarBaud) {
   PortParser &port = ports[index];
   port.serial->end();
   preparePins(configuredRx, configuredTx);
   port.size = 0;
   port.kind = RadarKind::None;
   port.lastFrame = 0;
-  port.serial->begin(kRadarBaud, SERIAL_8N1, pin, -1);
+  port.rawBytes = 0;
+  port.rawSampleSize = 0;
+  if (POGSENSOR_RADAR_RX_PULLUP) pinMode(pin, INPUT_PULLUP);
+  port.serial->begin(baud, SERIAL_8N1, pin, -1,
+                     POGSENSOR_RADAR_RX_INVERTED != 0);
+}
+
+ProbeStats probeStats(const PortParser &port) {
+  ProbeStats stats;
+  stats.rawBytes = port.rawBytes;
+  stats.sampleSize = port.rawSampleSize;
+  memcpy(stats.sample, port.rawSample, stats.sampleSize);
+  return stats;
+}
+
+void printProbeStats(size_t index, const char *side, uint8_t pin,
+                     uint32_t baud, const ProbeStats &stats) {
+  Serial.printf("[RadarDiag] port %c %s GPIO %u @ %lu: %lu octet(s)",
+                static_cast<char>('A' + index), side, pin,
+                static_cast<unsigned long>(baud),
+                static_cast<unsigned long>(stats.rawBytes));
+  if (stats.sampleSize) {
+    Serial.print(" · ");
+    for (size_t offset = 0; offset < stats.sampleSize; ++offset) {
+      if (offset) Serial.print(' ');
+      if (stats.sample[offset] < 0x10) Serial.print('0');
+      Serial.print(stats.sample[offset], HEX);
+    }
+  }
+  Serial.println();
 }
 
 void probePorts(const bool enabled[2]) {
@@ -195,6 +254,64 @@ void probePorts(const bool enabled[2]) {
     delay(2);
   }
 }
+
+bool probeOtherBauds(size_t index, const char *side, uint8_t pin,
+                     uint8_t configuredRx, uint8_t configuredTx,
+                     RadarKind &detectedKind, uint32_t &detectedBaud) {
+  const bool enabled[2] = {index == 0, index == 1};
+  for (uint32_t baud : kAlternateRadarBauds) {
+    readings[index] = RadarReading{};
+    beginReceiveOnly(index, pin, configuredRx, configuredTx, baud);
+    probePorts(enabled);
+    printProbeStats(index, side, pin, baud, probeStats(ports[index]));
+    if (ports[index].kind == RadarKind::None) continue;
+    detectedKind = ports[index].kind;
+    detectedBaud = baud;
+    return true;
+  }
+  return false;
+}
+
+#if POGSENSOR_RADAR_ACTIVE_PROBE
+void probeLd2410Command(size_t index, uint8_t rxPin, uint8_t txPin) {
+  static constexpr uint8_t kEnableConfiguration[] = {
+      0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF,
+      0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+  static constexpr uint8_t kEndConfiguration[] = {
+      0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00,
+      0xFE, 0x00, 0x04, 0x03, 0x02, 0x01};
+
+  PortParser &port = ports[index];
+  port.serial->end();
+  preparePins(rxPin, txPin);
+  port.size = 0;
+  port.rawBytes = 0;
+  port.rawSampleSize = 0;
+  port.serial->begin(kRadarBaud, SERIAL_8N1, rxPin, txPin);
+  delay(50);
+  while (port.serial->available()) port.serial->read();
+
+  port.serial->write(kEnableConfiguration, sizeof(kEnableConfiguration));
+  port.serial->flush();
+  const bool enabled[2] = {index == 0, index == 1};
+  probePorts(enabled);
+  printProbeStats(index, "PING RX", rxPin, kRadarBaud, probeStats(port));
+
+  bool acknowledged = false;
+  for (size_t offset = 0; offset + 4 <= port.size; ++offset) {
+    acknowledged |= port.data[offset] == 0xFD &&
+                    port.data[offset + 1] == 0xFC &&
+                    port.data[offset + 2] == 0xFB &&
+                    port.data[offset + 3] == 0xFA;
+  }
+  Serial.printf("[RadarDiag] commande LD2410: %s\n",
+                acknowledged ? "réponse reçue" : "aucune réponse");
+  port.serial->write(kEndConfiguration, sizeof(kEndConfiguration));
+  port.serial->flush();
+  port.serial->end();
+  preparePins(rxPin, txPin);
+}
+#endif
 }  // namespace
 
 void radarSensorBegin() {
@@ -207,6 +324,8 @@ void radarSensorBegin() {
   }
   probePorts(bothPorts);
 
+  ProbeStats expectedStats[2] = {probeStats(ports[0]), probeStats(ports[1])};
+
   bool detectedOnExpected[2] = {ports[0].kind != RadarKind::None,
                                 ports[1].kind != RadarKind::None};
   bool probeAlternate[2] = {!detectedOnExpected[0], !detectedOnExpected[1]};
@@ -217,18 +336,51 @@ void radarSensorBegin() {
   }
   probePorts(probeAlternate);
 
+  ProbeStats alternateStats[2];
+  for (size_t index = 0; index < 2; ++index) {
+    if (probeAlternate[index]) alternateStats[index] = probeStats(ports[index]);
+    printProbeStats(index, "RX", rxPins[index], kRadarBaud,
+                    expectedStats[index]);
+    if (probeAlternate[index]) {
+      printProbeStats(index, "TX", txPins[index], kRadarBaud,
+                      alternateStats[index]);
+    }
+  }
+
+#if POGSENSOR_RADAR_ACTIVE_PROBE
+  if (!detectedOnExpected[0]) {
+    probeLd2410Command(0, rxPins[0], txPins[0]);
+  }
+#endif
+
   for (size_t index = 0; index < 2; ++index) {
     bool detectedOnAlternate =
         probeAlternate[index] && ports[index].kind != RadarKind::None;
+    RadarKind detectedKind = ports[index].kind;
+    uint32_t detectedBaud = kRadarBaud;
+
+    if (!detectedOnExpected[index] && !detectedOnAlternate) {
+      if (POGSENSOR_RADAR_FULL_SCAN || expectedStats[index].rawBytes) {
+        detectedOnExpected[index] = probeOtherBauds(
+            index, "RX", rxPins[index], rxPins[index], txPins[index],
+            detectedKind, detectedBaud);
+      }
+      if (!detectedOnExpected[index] &&
+          (POGSENSOR_RADAR_FULL_SCAN || alternateStats[index].rawBytes)) {
+        detectedOnAlternate = probeOtherBauds(
+            index, "TX", txPins[index], rxPins[index], txPins[index],
+            detectedKind, detectedBaud);
+      }
+    }
+
     wiring[index] = pogsensor::radar::classifyWiring(
         detectedOnExpected[index], detectedOnAlternate);
-    uint8_t activeRx = wiring[index] == pogsensor::radar::WiringStatus::Reversed
-                           ? txPins[index]
-                           : rxPins[index];
-    RadarKind detectedKind = ports[index].kind;
-    beginReceiveOnly(index, activeRx, rxPins[index], txPins[index]);
+    uint8_t activeRx = detectedOnAlternate ? txPins[index] : rxPins[index];
+    activeBauds[index] = detectedBaud;
+    beginReceiveOnly(index, activeRx, rxPins[index], txPins[index],
+                     activeBauds[index]);
     ports[index].kind = detectedKind;
-    ports[index].lastFrame = millis();
+    ports[index].lastFrame = detectedKind == RadarKind::None ? 0 : millis();
   }
   rebuildCombined();
 }
@@ -256,6 +408,10 @@ const char *radarSensorPortModel(size_t index) {
 
 pogsensor::radar::WiringStatus radarSensorPortWiring(size_t index) {
   return index < 2 ? wiring[index] : pogsensor::radar::WiringStatus::Unknown;
+}
+
+uint32_t radarSensorPortBaud(size_t index) {
+  return index < 2 ? activeBauds[index] : 0;
 }
 
 const char *radarSensorWiringName(pogsensor::radar::WiringStatus status) {

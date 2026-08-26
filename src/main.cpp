@@ -98,6 +98,29 @@ void sampleEnvironment(uint32_t now) {
   nextSample = now + g_config.samplePeriodSeconds * 1000UL;
 }
 
+void printRadarReading(const RadarReading &radar) {
+  Serial.printf("[Radar] %s · %u cible(s) · mouvement %s\n",
+                radar.occupied ? "présence" : "libre", radar.targetCount,
+                radar.motion ? "oui" : "non");
+  if (radar.targets[0].active || radar.targets[1].active ||
+      radar.targets[2].active) {
+    for (size_t index = 0; index < 3; ++index) {
+      const RadarTarget &target = radar.targets[index];
+      if (!target.active) continue;
+      Serial.printf(
+          "[RadarTarget] %u · x=%d mm · y=%d mm · vitesse=%d cm/s · "
+          "résolution=%u mm\n",
+          static_cast<unsigned>(index + 1), target.xMm, target.yMm,
+          target.speedCmS, target.resolutionMm);
+    }
+  } else if (radar.online) {
+    Serial.printf(
+        "[RadarDistance] mobile=%u cm · immobile=%u cm · détection=%u cm\n",
+        radar.movingDistanceCm, radar.stationaryDistanceCm,
+        radar.detectionDistanceCm);
+  }
+}
+
 void sampleRadar() {
   bool changed = radarSensorLoop();
   bool present = radarSensorPresent();
@@ -107,9 +130,7 @@ void sampleRadar() {
   }
   if (changed || present != radarWasPresent) {
     const RadarReading &radar = radarSensorReading();
-    Serial.printf("[Radar] %s · %u cible(s) · mouvement %s\n",
-                  radar.occupied ? "présence" : "libre", radar.targetCount,
-                  radar.motion ? "oui" : "non");
+    printRadarReading(radar);
     pogdevSetRadar(radar, true);
   }
   radarWasPresent = present;
@@ -185,15 +206,18 @@ void setup() {
   radarSensorBegin();
   presenceLightBegin();
   radarWasPresent = radarSensorPresent();
-  Serial.printf("[Radar] port A: %s · %s · broches RX/TX %u/%u\n",
+  Serial.printf("[Radar] port A: %s · %s · broches RX/TX %u/%u · %lu bauds\n",
                 radarSensorPortModel(0),
                 radarSensorWiringName(radarSensorPortWiring(0)),
-                g_config.radarARxPin, g_config.radarATxPin);
-  Serial.printf("[Radar] port B: %s · %s · broches RX/TX %u/%u\n",
+                g_config.radarARxPin, g_config.radarATxPin,
+                static_cast<unsigned long>(radarSensorPortBaud(0)));
+  Serial.printf("[Radar] port B: %s · %s · broches RX/TX %u/%u · %lu bauds\n",
                 radarSensorPortModel(1),
                 radarSensorWiringName(radarSensorPortWiring(1)),
-                g_config.radarBRxPin, g_config.radarBTxPin);
+                g_config.radarBRxPin, g_config.radarBTxPin,
+                static_cast<unsigned long>(radarSensorPortBaud(1)));
   if (radarWasPresent) {
+    printRadarReading(radarSensorReading());
     pogdevSetRadar(radarSensorReading(), true);
   }
   pogdevBegin();
