@@ -32,6 +32,7 @@ bool radarSensorPresent();
 const char *radarSensorModel();
 const char *radarSensorPortModel(size_t index);
 pogsensor::radar::WiringStatus radarSensorPortWiring(size_t index);
+uint32_t radarSensorPortBaud(size_t index);
 const char *radarSensorWiringName(pogsensor::radar::WiringStatus status);
 bool radarSensorMateriallyChanged(const RadarReading &previous,
                                   const RadarReading &next);

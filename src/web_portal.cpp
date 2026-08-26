@@ -182,6 +182,8 @@ void sendStatus() {
   doc["radar"] = radarSensorModel();
   doc["radar_a_wiring"] = radarSensorWiringName(radarSensorPortWiring(0));
   doc["radar_b_wiring"] = radarSensorWiringName(radarSensorPortWiring(1));
+  doc["radar_a_baud"] = radarSensorPortBaud(0);
+  doc["radar_b_baud"] = radarSensorPortBaud(1);
   doc["hw_id"] = pogdevHardwareId();
   doc["poghome_status"] = pogdevIsConnected() ? "connecté à POG Home" :
                               pogdevIsAdopted() ? "adopté" :
