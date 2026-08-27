@@ -12,6 +12,7 @@
 
 #include "config.h"
 #include "environment_sensor.h"
+#include "pogdev_retry.h"
 #include "presence_light.h"
 #include "radar_sensor.h"
 
@@ -21,7 +22,6 @@
 
 namespace {
 constexpr char kNamespace[] = "pogdev";
-constexpr uint32_t kReconnectPeriodMs = 5000;
 constexpr uint32_t kFullStatePeriodMs = 300000;
 
 struct Credentials {
@@ -54,6 +54,9 @@ bool refreshAnnouncement = true;
 RadarReading currentRadar;
 bool hasRadarReading = false;
 bool manifestDirty = false;
+pogdev::Backoff mqttBackoff;
+pogdev::AuthGate authGate;
+pogdev::OfflineWatch offlineWatch;
 
 String deviceModel() {
   String result = String("POG Sensor · ") + environmentSensorModel();
@@ -514,11 +517,24 @@ bool connectMqtt() {
   if (!ok) {
     if (mqtt.state() == MQTT_CONNECT_UNAUTHORIZED ||
         mqtt.state() == MQTT_CONNECT_BAD_CREDENTIALS) {
-      Serial.println("[PogHome] compte supprimé, nouvelle adoption");
-      clearIdentity();
+      // Un CONNACK refusé n'est plus un ordre d'oubli : pendant que POG Home
+      // redémarre, le courtier refuse avec des comptes pas encore
+      // reprovisionnés, et l'effacement coûtait l'adoption entière du foyer —
+      // irrécupérable sans humain (panne du 27 août 2026). La relève tranche à
+      // sa place : 404 = vraiment oublié (announceAndCollect efface),
+      // « pending » = demande de ré-adoption posée dans l'inventaire,
+      // « adopted » = identifiants neufs enregistrés.
+      if (pogdev::authGateRejected(authGate, millis()) &&
+          (poghomeAddress || discoverPogHome())) {
+        Serial.println("[PogHome] identifiants refusés avec insistance : "
+                       "relève auprès de POG Home");
+        announceAndCollect(false);
+      }
     }
     return false;
   }
+  pogdev::authGateConnected(authGate);
+  pogdev::backoffConnected(mqttBackoff);
   String cmdTopic = "pog/" + credentials.deviceId + "/cmd";
   mqtt.subscribe(cmdTopic.c_str(), 1);
   mqtt.publish(statusTopic.c_str(), "online", true);
@@ -537,7 +553,20 @@ void pogdevBegin() {
 
 void pogdevLoop() {
   uint32_t now = millis();
-  if (WiFi.status() != WL_CONNECTED) {
+  bool wifiUp = WiFi.status() == WL_CONNECTED;
+  // Le filet du 27 août : le remède constaté était de débrancher puis
+  // rebrancher chaque appareil. Trente minutes continues adopté, Wi-Fi debout
+  // et courtier absent, et on refait ce geste tout seul — ça guérit aussi ce
+  // que le code ne sait pas énumérer (sockets épuisées, pile figée).
+  if (pogdev::offlineWatchTick(
+          offlineWatch, wifiUp && credentials.valid() && !mqtt.connected(),
+          now)) {
+    Serial.println("[PogHome] 30 min sans courtier malgré le Wi-Fi : "
+                   "redémarrage");
+    delay(80);
+    ESP.restart();
+  }
+  if (!wifiUp) {
     mqtt.disconnect();
     return;
   }
@@ -558,16 +587,23 @@ void pogdevLoop() {
   }
   if (!mqtt.connected()) {
     if ((int32_t)(now - nextReconnect) >= 0) {
-      if (!connectMqtt() && credentials.valid() &&
-          (int32_t)(now - nextRediscovery) >= 0) {
-        poghomeAddress = IPAddress();
-        if (discoverPogHome()) {
-          credentials.host = poghomeAddress.toString();
-          saveCredentials(credentials);
+      if (connectMqtt()) {
+        nextReconnect = now;
+      } else {
+        if (credentials.valid() && (int32_t)(now - nextRediscovery) >= 0) {
+          poghomeAddress = IPAddress();
+          if (discoverPogHome()) {
+            credentials.host = poghomeAddress.toString();
+            saveCredentials(credentials);
+          }
+          nextRediscovery = now + 30000;
         }
-        nextRediscovery = now + 30000;
+        // Reprise sans fin : 5 s doublées jusqu'à 60 s. Le pas ne revient à la
+        // base qu'au CONNACK accepté (backoffConnected), jamais avant — un
+        // appareil encastré doit retrouver un courtier qui revient des heures
+        // plus tard sans le marteler quand il est absent.
+        nextReconnect = now + pogdev::backoffNextDelayMs(mqttBackoff);
       }
-      nextReconnect = now + kReconnectPeriodMs;
     }
     return;
   }
