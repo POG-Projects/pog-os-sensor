@@ -334,6 +334,7 @@ void handleSave() {
   g_config.presenceLightBrightness = presenceBrightness;
   g_config.presenceLightColor =
       static_cast<uint32_t>(strtoul(presenceColor.c_str() + 1, nullptr, 16));
+  g_config.presenceLightColorTemperature = false;
   g_config.presenceLightHoldSeconds = presenceHold;
   g_config.samplePeriodSeconds =
       constrain(server.arg("period").toInt(), 5, 3600);

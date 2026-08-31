@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "config.h"
+#include "light_transition.h"
 
 namespace {
 bool manualOn = false;
@@ -10,6 +11,9 @@ bool outputOn = false;
 bool occupiedNow = false;
 bool suppressUntilClear = false;
 uint32_t lastPresenceAt = 0;
+uint8_t renderedBrightness = 55;
+uint32_t renderedColor = 0xFFD28A;
+pogsensor::LightTransition transition;
 
 uint8_t channel(float value) {
   return static_cast<uint8_t>(roundf(constrain(value, 0.0f, 255.0f)));
@@ -57,6 +61,40 @@ uint32_t hsToRgb(float hue, float saturation) {
                  channel((green + match) * 255.0f),
                  channel((blue + match) * 255.0f));
 }
+
+uint32_t kelvinToRgb(float kelvin) {
+  float temperature = constrain(kelvin, 1000.0f, 10000.0f) / 100.0f;
+  float red = temperature <= 66.0f
+                  ? 255.0f
+                  : 329.698727446f * powf(temperature - 60.0f, -0.1332047592f);
+  float green = temperature <= 66.0f
+                    ? 99.4708025861f * logf(temperature) - 161.1195681661f
+                    : 288.1221695283f * powf(temperature - 60.0f,
+                                             -0.0755148492f);
+  float blue = temperature >= 66.0f
+                   ? 255.0f
+                   : temperature <= 19.0f
+                         ? 0.0f
+                         : 138.5177312231f * logf(temperature - 10.0f) -
+                               305.0447927307f;
+  return packRgb(channel(red), channel(green), channel(blue));
+}
+
+void settleTransition() {
+  transition.active = false;
+  renderedBrightness = g_config.presenceLightBrightness;
+  renderedColor = g_config.presenceLightColor;
+}
+
+void beginTransition(uint32_t now, float seconds, uint8_t fromBrightness,
+                     uint32_t fromColor) {
+  uint32_t durationMs = static_cast<uint32_t>(
+      roundf(constrain(seconds, 0.0f, 300.0f) * 1000.0f));
+  pogsensor::startLightTransition(
+      transition, now, durationMs, fromBrightness,
+      g_config.presenceLightBrightness, fromColor,
+      g_config.presenceLightColor, renderedBrightness, renderedColor);
+}
 }  // namespace
 
 void presenceLightBegin() {
@@ -65,9 +103,12 @@ void presenceLightBegin() {
   occupiedNow = false;
   suppressUntilClear = false;
   lastPresenceAt = 0;
+  settleTransition();
 }
 
 bool presenceLightUpdate(bool radarOnline, bool occupied, uint32_t now) {
+  pogsensor::advanceLightTransition(transition, now, renderedBrightness,
+                                    renderedColor);
   bool previous = outputOn;
   if (!g_config.statusLightInstalled) {
     occupiedNow = false;
@@ -94,9 +135,9 @@ bool presenceLightUpdate(bool radarOnline, bool occupied, uint32_t now) {
 bool presenceLightIsOn() { return outputOn; }
 bool presenceLightAutomatic() { return g_config.presenceLightAuto; }
 uint8_t presenceLightBrightness() {
-  return g_config.presenceLightBrightness;
+  return renderedBrightness;
 }
-uint32_t presenceLightColor() { return g_config.presenceLightColor; }
+uint32_t presenceLightColor() { return renderedColor; }
 uint16_t presenceLightHoldSeconds() {
   return g_config.presenceLightHoldSeconds;
 }
@@ -105,6 +146,7 @@ void presenceLightTurnOn() {
   manualOn = true;
   suppressUntilClear = false;
   outputOn = true;
+  if (!transition.active) settleTransition();
 }
 
 void presenceLightTurnOff() {
@@ -112,6 +154,7 @@ void presenceLightTurnOff() {
   suppressUntilClear = occupiedNow;
   lastPresenceAt = 0;
   outputOn = false;
+  settleTransition();
 }
 
 void presenceLightToggle() {
@@ -130,32 +173,59 @@ void presenceLightSetAutomatic(bool enabled) {
   }
 }
 
-void presenceLightSetBrightness(float percent) {
+void presenceLightSetBrightness(float percent, float transitionSeconds,
+                                uint32_t now) {
+  pogsensor::advanceLightTransition(transition, now, renderedBrightness,
+                                    renderedColor);
+  uint8_t fromBrightness = outputOn ? renderedBrightness : 0;
+  uint32_t fromColor = renderedColor;
   g_config.presenceLightBrightness = static_cast<uint8_t>(
       roundf(constrain(percent, 0.0f, 100.0f)));
+  beginTransition(now, transitionSeconds, fromBrightness, fromColor);
 }
 
 void presenceLightSetHs(float hue, float saturation) {
   g_config.presenceLightColor = hsToRgb(hue, saturation);
+  g_config.presenceLightColorTemperature = false;
+  settleTransition();
 }
 
 void presenceLightSetColorTemperature(float kelvin) {
-  float temperature = constrain(kelvin, 1000.0f, 10000.0f) / 100.0f;
-  float red = temperature <= 66.0f
-                  ? 255.0f
-                  : 329.698727446f * powf(temperature - 60.0f, -0.1332047592f);
-  float green = temperature <= 66.0f
-                    ? 99.4708025861f * logf(temperature) - 161.1195681661f
-                    : 288.1221695283f * powf(temperature - 60.0f,
-                                             -0.0755148492f);
-  float blue = temperature >= 66.0f
-                   ? 255.0f
-                   : temperature <= 19.0f
-                         ? 0.0f
-                         : 138.5177312231f * logf(temperature - 10.0f) -
-                               305.0447927307f;
-  g_config.presenceLightColor =
-      packRgb(channel(red), channel(green), channel(blue));
+  g_config.presenceLightKelvin = static_cast<uint16_t>(
+      roundf(constrain(kelvin, 1000.0f, 10000.0f)));
+  g_config.presenceLightColor = kelvinToRgb(g_config.presenceLightKelvin);
+  g_config.presenceLightColorTemperature = true;
+  settleTransition();
+}
+
+bool presenceLightSetLight(const PresenceLightRequest &request, uint32_t now) {
+  if (!validPresenceLightRequest(request)) return false;
+
+  pogsensor::advanceLightTransition(transition, now, renderedBrightness,
+                                    renderedColor);
+  bool wasOn = outputOn;
+  uint8_t fromBrightness = wasOn ? renderedBrightness : 0;
+  uint32_t fromColor = renderedColor;
+
+  if (request.hasBrightness) {
+    g_config.presenceLightBrightness =
+        static_cast<uint8_t>(roundf(request.brightness));
+  }
+  if (request.hasHue) {
+    g_config.presenceLightColor = hsToRgb(request.hue, request.saturation);
+    g_config.presenceLightColorTemperature = false;
+  } else if (request.hasKelvin) {
+    g_config.presenceLightKelvin =
+        static_cast<uint16_t>(roundf(request.kelvin));
+    g_config.presenceLightColor = kelvinToRgb(g_config.presenceLightKelvin);
+    g_config.presenceLightColorTemperature = true;
+  }
+
+  manualOn = true;
+  suppressUntilClear = false;
+  outputOn = true;
+  beginTransition(now, request.transitionSeconds, fromBrightness, fromColor);
+  return true;
 }
 
 void presenceLightSetHoldSeconds(float seconds) {
@@ -165,13 +235,18 @@ void presenceLightSetHoldSeconds(float seconds) {
 
 void presenceLightFillState(JsonObject light, JsonObject automatic,
                             JsonObject hold) {
-  float hue, saturation;
-  rgbToHs(g_config.presenceLightColor, hue, saturation);
   light["on"] = outputOn;
   light["brightness"] = g_config.presenceLightBrightness;
-  light["mode"] = "hs";
-  light["hue"] = roundf(hue * 10.0f) / 10.0f;
-  light["saturation"] = roundf(saturation * 10.0f) / 10.0f;
+  if (g_config.presenceLightColorTemperature) {
+    light["mode"] = "ct";
+    light["kelvin"] = g_config.presenceLightKelvin;
+  } else {
+    float hue, saturation;
+    rgbToHs(g_config.presenceLightColor, hue, saturation);
+    light["mode"] = "hs";
+    light["hue"] = roundf(hue * 10.0f) / 10.0f;
+    light["saturation"] = roundf(saturation * 10.0f) / 10.0f;
+  }
   automatic["on"] = g_config.presenceLightAuto;
   hold["value"] = g_config.presenceLightHoldSeconds;
 }
