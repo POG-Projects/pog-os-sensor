@@ -44,6 +44,8 @@ struct DeviceConfig {
   bool presenceLightAuto = true;
   uint8_t presenceLightBrightness = 55;
   uint32_t presenceLightColor = 0xFFD28A;
+  bool presenceLightColorTemperature = false;
+  uint16_t presenceLightKelvin = 2700;
   uint16_t presenceLightHoldSeconds = 8;
   uint32_t samplePeriodSeconds = 30;
   float temperatureOffset = 0.0f;

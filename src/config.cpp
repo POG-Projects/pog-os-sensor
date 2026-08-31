@@ -44,6 +44,10 @@ bool configLoad() {
   g_config.presenceLightColor =
       doc["presence_light_color"] | static_cast<uint32_t>(0xFFD28A);
   g_config.presenceLightColor &= 0xFFFFFF;
+  g_config.presenceLightColorTemperature =
+      doc["presence_light_color_temperature"] | false;
+  g_config.presenceLightKelvin = constrain(
+      doc["presence_light_kelvin"] | 2700, 1000, 10000);
   g_config.presenceLightHoldSeconds = constrain(
       doc["presence_light_hold"] | 8, 0, 300);
   g_config.samplePeriodSeconds =
@@ -71,6 +75,9 @@ bool configSave() {
   doc["presence_light_auto"] = g_config.presenceLightAuto;
   doc["presence_light_brightness"] = g_config.presenceLightBrightness;
   doc["presence_light_color"] = g_config.presenceLightColor;
+  doc["presence_light_color_temperature"] =
+      g_config.presenceLightColorTemperature;
+  doc["presence_light_kelvin"] = g_config.presenceLightKelvin;
   doc["presence_light_hold"] = g_config.presenceLightHoldSeconds;
   doc["sample_period"] = g_config.samplePeriodSeconds;
   doc["temperature_offset"] = g_config.temperatureOffset;

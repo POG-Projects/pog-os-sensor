@@ -54,6 +54,10 @@ void beginStation() {
 }
 
 void onWifiConnected() {
+  // Le suivi lumineux musical compare les échéances UTC publiées par la
+  // source. Arduino garde une horloge monotone tant que SNTP n'a pas répondu ;
+  // effect_sync retombe alors automatiquement sur arrival + lead_ms.
+  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com", "time.google.com");
   if (!mdnsStarted && MDNS.begin(kHostname)) {
     mdnsStarted = true;
     MDNS.addService("http", "tcp", 80);
