@@ -12,8 +12,10 @@
 
 #include "config.h"
 #include "environment_sensor.h"
+#include "effect_sync.h"
 #include "pogdev_retry.h"
 #include "presence_light.h"
+#include "status_led.h"
 #include "radar_sensor.h"
 
 #ifndef POGSENSOR_FW_VERSION
@@ -54,9 +56,13 @@ bool refreshAnnouncement = true;
 RadarReading currentRadar;
 bool hasRadarReading = false;
 bool manifestDirty = false;
+uint32_t nextManifestPublish = 0;
 pogdev::Backoff mqttBackoff;
+pogdev::Backoff manifestBackoff{1000, 60000, 1000};
 pogdev::AuthGate authGate;
 pogdev::OfflineWatch offlineWatch;
+String effectGroupId;
+String effectFrameTopic;
 
 String deviceModel() {
   String result = String("POG Sensor · ") + environmentSensorModel();
@@ -272,13 +278,99 @@ void addBinary(JsonArray entities, const char *key, const char *name,
   trait["config"]["read_only"] = true;
 }
 
-void publishHello() {
+void addLightEffectAction(JsonArray traits) {
+  static const char *effects[] = {
+      "Uni", "Arc-en-ciel", "Respiration", "Comète", "Scintillement"};
+  JsonObject trait = traits.add<JsonObject>();
+  trait["id"] = "action";
+  JsonObject command = trait["config"]["commands"].to<JsonArray>().add<JsonObject>();
+  command["name"] = "sync_effect";
+  command["label"] = "Synchroniser l’ambiance";
+  command["sensitive"] = false;
+  command["reversible"] = true;
+  JsonArray params = command["params"].to<JsonArray>();
+  JsonObject effect = params.add<JsonObject>();
+  effect["name"] = "effect";
+  effect["kind"] = "enum";
+  effect["required"] = true;
+  JsonArray options = effect["enum"].to<JsonArray>();
+  for (const char *name : effects) options.add(name);
+  auto number = [&](const char *name, float minimum, float maximum) {
+    JsonObject param = params.add<JsonObject>();
+    param["name"] = name;
+    param["kind"] = "number";
+    param["required"] = true;
+    param["min"] = minimum;
+    param["max"] = maximum;
+  };
+  number("speed", 0, 100);
+  number("brightness", 0, 100);
+  number("primary_hue", 0, 360);
+  number("primary_saturation", 0, 100);
+  number("secondary_hue", 0, 360);
+  number("secondary_saturation", 0, 100);
+
+  auto stringParam = [](JsonArray commandParams, const char *name,
+                        const char *const *values = nullptr,
+                        size_t valueCount = 0) {
+    JsonObject param = commandParams.add<JsonObject>();
+    param["name"] = name;
+    param["kind"] = values ? "enum" : "string";
+    param["required"] = true;
+    if (values) {
+      JsonArray options = param["enum"].to<JsonArray>();
+      for (size_t i = 0; i < valueCount; ++i) options.add(values[i]);
+    }
+  };
+  JsonArray commands = trait["config"]["commands"].as<JsonArray>();
+  JsonObject join = commands.add<JsonObject>();
+  join["name"] = "join_effect_group";
+  join["label"] = "Suivre une ambiance musicale";
+  join["sensitive"] = false;
+  join["reversible"] = true;
+  JsonArray joinParams = join["params"].to<JsonArray>();
+  stringParam(joinParams, "group_id");
+  static const char *roles[] = {"leader", "follower"};
+  stringParam(joinParams, "role", roles, 2);
+  stringParam(joinParams, "leader_entity_id");
+  auto timingNumber = [](JsonArray commandParams, const char *name,
+                         int minimum, int maximum) {
+    JsonObject param = commandParams.add<JsonObject>();
+    param["name"] = name;
+    param["kind"] = "number";
+    param["required"] = true;
+    param["min"] = minimum;
+    param["max"] = maximum;
+  };
+  timingNumber(joinParams, "presentation_delay_ms", 0, 500);
+  timingNumber(joinParams, "calibration_offset_ms", -100, 100);
+  static const char *visualizers[] = {"spectrum", "vu_meter", "bass_pulse",
+                                      "rainbow"};
+  JsonObject visualizer = joinParams.add<JsonObject>();
+  visualizer["name"] = "visualizer";
+  visualizer["kind"] = "enum";
+  visualizer["required"] = false;
+  visualizer["default"] = "spectrum";
+  JsonArray visualizerOptions = visualizer["enum"].to<JsonArray>();
+  for (const char *option : visualizers) visualizerOptions.add(option);
+  JsonObject leave = commands.add<JsonObject>();
+  leave["name"] = "leave_effect_group";
+  leave["label"] = "Quitter l’ambiance musicale";
+  leave["sensitive"] = false;
+  leave["reversible"] = true;
+  stringParam(leave["params"].to<JsonArray>(), "group_id");
+}
+
+bool publishHello() {
   JsonDocument doc;
   doc["proto"] = 1;
   doc["hw_id"] = hardwareId;
   doc["model"] = deviceModel();
   doc["fw_version"] = POGSENSOR_FW_VERSION;
   doc["name"] = g_config.name;
+  if (g_config.statusLightInstalled) {
+    doc["features"].to<JsonArray>().add("effect_sync_v1");
+  }
   JsonArray entities = doc["entities"].to<JsonArray>();
   if (environmentHasTemperature()) {
     addMeasurement(entities, "temperature", "Température", "temperature", "°C");
@@ -323,7 +415,13 @@ void publishHello() {
     lightPower["config"]["purpose"] = "nightlight";
     lightPower["config"]["purpose_label"] = "Veilleuse";
     lightTraits.add<JsonObject>()["id"] = "brightness";
-    lightTraits.add<JsonObject>()["id"] = "color";
+    JsonObject lightColor = lightTraits.add<JsonObject>();
+    lightColor["id"] = "color";
+    JsonArray colorModes = lightColor["config"]["modes"].to<JsonArray>();
+    colorModes.add("hs");
+    colorModes.add("color_temp");
+    lightTraits.add<JsonObject>()["id"] = "light";
+    addLightEffectAction(lightTraits);
 
     JsonObject automatic = entities.add<JsonObject>();
     automatic["key"] = "presence_light_auto";
@@ -363,6 +461,17 @@ void publishHello() {
             mqtt.publish(topic.c_str(), payload.c_str(), true);
   Serial.printf("[PogHome] manifeste %s (%u octets)\n",
                 ok ? "publié" : "en échec", payload.length());
+  return ok;
+}
+
+void publishHelloOrScheduleRetry(uint32_t now) {
+  if (publishHello()) {
+    manifestDirty = false;
+    pogdev::backoffConnected(manifestBackoff);
+    return;
+  }
+  manifestDirty = true;
+  nextManifestPublish = now + pogdev::backoffNextDelayMs(manifestBackoff);
 }
 
 void publishState() {
@@ -443,20 +552,107 @@ void publishState() {
   }
 }
 
-void handleCommand(char *, byte *payload, unsigned int length) {
+void cancelEffectFollow() {
+  if (effectFrameTopic.length() && mqtt.connected()) {
+    mqtt.unsubscribe(effectFrameTopic.c_str());
+  }
+  effectGroupId = "";
+  effectFrameTopic = "";
+  statusLedEffectSyncCancel();
+}
+
+void handleCommand(char *topic, byte *payload, unsigned int length) {
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
+  if (effectFrameTopic.length() && effectFrameTopic == topic) {
+    if (doc["seq"].isNull() || doc["mono_ms"].isNull() ||
+        doc["lead_ms"].isNull() ||
+        doc["level"].isNull() || doc["bass"].isNull() ||
+        doc["treble"].isNull()) return;
+    int leadMs = doc["lead_ms"] | -1;
+    if (leadMs < 0 || leadMs > 500) return;
+    statusLedEffectSyncFrame(
+        doc["seq"].as<uint32_t>(), doc["mono_ms"].as<uint64_t>(),
+        doc["present_at_ms"] | 0ULL, leadMs,
+        doc["level"].as<float>(),
+        doc["bass"].as<float>(), doc["treble"].as<float>(), millis());
+    return;
+  }
   String key = doc["key"].as<String>();
   String name = doc["name"].as<String>();
   JsonObjectConst params = doc["params"].as<JsonObjectConst>();
   bool changed = false;
   bool persist = false;
 
+  if (key == "presence_light" && name == "join_effect_group") {
+    String group = params["group_id"].as<String>();
+    String role = params["role"].as<String>();
+    String leader = params["leader_entity_id"].as<String>();
+    int delay = params["presentation_delay_ms"] | 0;
+    int calibration = params["calibration_offset_ms"] | 0;
+    String visualizer = params["visualizer"] | "spectrum";
+    pogdev::EffectSync candidate;
+    if (params["presentation_delay_ms"].isNull() ||
+        params["calibration_offset_ms"].isNull() ||
+        !g_config.statusLightInstalled ||
+        !pogdev::effectSyncJoin(candidate, group.c_str(), role.c_str(),
+                                leader.c_str(), delay, calibration,
+                                visualizer.c_str())) {
+      Serial.println("[PogHome] join_effect_group refusé");
+      return;
+    }
+    String nextTopic = "pog/effects/" + group + "/frame";
+    if (!mqtt.subscribe(nextTopic.c_str(), 0)) return;
+    String oldTopic = effectFrameTopic;
+    if (!statusLedEffectSyncJoin(group.c_str(), leader.c_str(), delay,
+                                 calibration, visualizer.c_str())) {
+      mqtt.unsubscribe(nextTopic.c_str());
+      return;
+    }
+    effectGroupId = group;
+    effectFrameTopic = nextTopic;
+    if (oldTopic.length() && oldTopic != nextTopic) mqtt.unsubscribe(oldTopic.c_str());
+    presenceLightTurnOn();
+    stateDirty = true;
+    return;
+  }
+  if (key == "presence_light" && name == "leave_effect_group") {
+    String group = params["group_id"].as<String>();
+    if (group == effectGroupId && statusLedEffectSyncLeave(group.c_str())) {
+      if (effectFrameTopic.length()) mqtt.unsubscribe(effectFrameTopic.c_str());
+      effectGroupId = "";
+      effectFrameTopic = "";
+    }
+    return;
+  }
+  if (effectFrameTopic.length() && key.startsWith("presence_light")) {
+    cancelEffectFollow();
+  }
+
   if (!g_config.statusLightInstalled && key.startsWith("presence_light")) {
     Serial.println("[PogHome] commande LED refusée: module non installé");
     return;
   }
   if (key == "presence_light") {
+    if (name == "sync_effect") {
+      String effect = params["effect"].as<String>();
+      float brightness = constrain(params["brightness"] | 80.0f, 0.0f, 100.0f);
+      float hue = params["primary_hue"] | 0.0f;
+      float saturation = params["primary_saturation"] | 100.0f;
+      if (statusLedSetUserEffect(
+              effect.c_str(), constrain((int)(params["speed"] | 50), 0, 100),
+              static_cast<uint8_t>(roundf(brightness)), hue, saturation,
+              params["secondary_hue"] | 240.0f,
+              params["secondary_saturation"] | 100.0f, millis())) {
+        presenceLightSetBrightness(brightness, 0, millis());
+        presenceLightSetHs(hue, saturation);
+        presenceLightTurnOn();
+        changed = persist = true;
+      }
+    } else {
+      // Un réglage de lampe classique remplace l'animation visible.
+      statusLedClearUserEffect();
+    }
     if (name == "turn_on") {
       presenceLightTurnOn();
       changed = true;
@@ -467,7 +663,8 @@ void handleCommand(char *, byte *payload, unsigned int length) {
       presenceLightToggle();
       changed = true;
     } else if (name == "set_brightness") {
-      presenceLightSetBrightness(params["brightness"] | 0.0f);
+      presenceLightSetBrightness(params["brightness"] | 0.0f,
+                                 params["transition"] | 0.0f, millis());
       changed = persist = true;
     } else if (name == "set_hs") {
       presenceLightSetHs(params["hue"] | 0.0f,
@@ -476,6 +673,21 @@ void handleCommand(char *, byte *payload, unsigned int length) {
     } else if (name == "set_color_temp") {
       presenceLightSetColorTemperature(params["kelvin"] | 2700.0f);
       changed = persist = true;
+    } else if (name == "set_light") {
+      PresenceLightRequest request;
+      request.hasBrightness = !params["brightness"].isNull();
+      request.brightness = params["brightness"] | 0.0f;
+      request.hasHue = !params["hue"].isNull();
+      request.hue = params["hue"] | 0.0f;
+      request.hasSaturation = !params["saturation"].isNull();
+      request.saturation = params["saturation"] | 0.0f;
+      request.hasKelvin = !params["kelvin"].isNull();
+      request.kelvin = params["kelvin"] | 0.0f;
+      request.transitionSeconds = params["transition"] | 0.0f;
+      if (presenceLightSetLight(request, millis())) {
+        changed = true;
+        persist = request.hasBrightness || request.hasHue || request.hasKelvin;
+      }
     }
   } else if (key == "presence_light_auto") {
     bool enabled = presenceLightAutomatic();
@@ -537,8 +749,14 @@ bool connectMqtt() {
   pogdev::backoffConnected(mqttBackoff);
   String cmdTopic = "pog/" + credentials.deviceId + "/cmd";
   mqtt.subscribe(cmdTopic.c_str(), 1);
+  if (effectFrameTopic.length()) mqtt.subscribe(effectFrameTopic.c_str(), 0);
   mqtt.publish(statusTopic.c_str(), "online", true);
-  publishHello();
+  // Le manifeste décrit le firmware actuellement exécuté. Il est donc
+  // reconstruit après CHAQUE CONNACK accepté, pas seulement au démarrage. Si
+  // PubSubClient ne peut pas l'enfiler (buffer/socket momentanément plein), on
+  // garde l'intention et on réessaie jusqu'au succès au lieu de perdre les
+  // nouvelles capacités jusqu'au prochain redémarrage.
+  publishHelloOrScheduleRetry(millis());
   publishState();
   Serial.println("[PogHome] MQTT connecté");
   return true;
@@ -608,9 +826,8 @@ void pogdevLoop() {
     return;
   }
   mqtt.loop();
-  if (manifestDirty) {
-    publishHello();
-    manifestDirty = false;
+  if (manifestDirty && (int32_t)(now - nextManifestPublish) >= 0) {
+    publishHelloOrScheduleRetry(now);
   }
   if (stateDirty || (int32_t)(now - nextFullState) >= 0) publishState();
 }
@@ -627,7 +844,11 @@ void pogdevSetRadar(const RadarReading &reading, bool forcePublish) {
   stateDirty = stateDirty || forcePublish;
 }
 
-void pogdevRefreshManifest() { manifestDirty = true; }
+void pogdevRefreshManifest() {
+  manifestDirty = true;
+  nextManifestPublish = 0;
+  pogdev::backoffConnected(manifestBackoff);
+}
 void pogdevRefreshState() { stateDirty = true; }
 
 const String &pogdevHardwareId() { return hardwareId; }
