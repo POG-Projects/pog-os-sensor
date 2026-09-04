@@ -3,6 +3,7 @@ name: CI & Release
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths-ignore:
       - "**.md"
   pull_request:
@@ -10,6 +11,11 @@ on:
     paths-ignore:
       - "**.md"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing semantic-version tag to publish
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,54 +26,43 @@ permissions:
 
 jobs:
   prepare:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      bumped: ${{ steps.version.outputs.bumped }}
-
     steps:
       - uses: actions/checkout@v6
-
-      - name: Determine version before build
+        with:
+          persist-credentials: false
+      - name: Validate declared version
         id: version
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           VERSION=$(tr -d '[:space:]' < version.txt)
-          BUMPED=false
-
-          if gh release view "v$VERSION" > /dev/null 2>&1; then
-            echo "Release v$VERSION already exists, auto-incrementing..."
-            LATEST_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName')
-            LATEST_VERSION=${LATEST_TAG#v}
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_VERSION"
-            VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
-            BUMPED=true
-            echo "New version: $VERSION"
+          printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "v$VERSION" = "$RELEASE_TAG"
           fi
-
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid semantic version: $VERSION" >&2
-            exit 1
-          fi
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "bumped=$BUMPED" >> "$GITHUB_OUTPUT"
 
   host-tests:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
+        with:
+          persist-credentials: false
       - name: Compile and run host tests
         run: |
+          python3 test_host/test_release_workflow.py
           for source in test_host/*.cpp; do
             binary="/tmp/$(basename "${source%.cpp}")"
             c++ -std=c++17 -Wall -Wextra -Werror -I include \
               "$source" -o "$binary"
             "$binary"
           done
-
       - name: Validate embedded dashboard JavaScript
         run: |
           awk '/<script>/{flag=1;next}/<\/script>/{flag=0}flag' \
@@ -75,6 +70,7 @@ jobs:
           node --check /tmp/pog-sensor-dashboard.js
 
   build:
+    if: github.event_name != 'workflow_dispatch'
     needs: [prepare, host-tests]
     runs-on: ubuntu-latest
     env:
@@ -85,27 +81,17 @@ jobs:
         include:
           - name: esp32c3
             env: esp32c3
-            chip: esp32c3
-            flash_size: "4MB"
-            label: "ESP32-C3 SuperMini (4 Mo)"
           - name: esp32s3
             env: esp32s3
-            chip: esp32s3
-            flash_size: "8MB"
-            label: "ESP32-S3 DevKitC-1 (8 Mo)"
           - name: esp32dev
             env: esp32dev
-            chip: esp32
-            flash_size: "4MB"
-            label: "ESP32 DevKit (4 Mo)"
-
     steps:
       - uses: actions/checkout@v6
-
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
@@ -115,174 +101,170 @@ jobs:
             ~/.platformio/platforms
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
           restore-keys: pio-${{ runner.os }}-
-
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
-
-      - name: Build ${{ matrix.name }}
+        run: pip install platformio==6.1.19
+      - name: Build and verify ${{ matrix.name }}
         run: |
           pio run -e "${{ matrix.env }}"
-          mkdir -p dist
-          cp ".pio/build/${{ matrix.env }}/firmware.bin" \
-            "dist/firmware-${{ matrix.name }}.bin"
-          cp ".pio/build/${{ matrix.env }}/firmware.factory.bin" \
-            "dist/merged-${{ matrix.name }}.bin"
-
-      - name: Validate embedded firmware version
-        run: |
-          python3 - <<'PY'
+          FIRMWARE=".pio/build/${{ matrix.env }}/firmware.bin"
+          python3 - "$FIRMWARE" <<'PY'
           import os
           import sys
 
           version = os.environ["POGSENSOR_BUILD_VERSION"]
-          path = "dist/firmware-${{ matrix.name }}.bin"
           marker = f"POGSensor/{version}".encode()
-          if marker not in open(path, "rb").read():
-              sys.exit(f"{path}: missing embedded version {version}")
-          print(f"{path}: embedded version {version} verified")
+          if marker not in open(sys.argv[1], "rb").read():
+              raise SystemExit(f"{sys.argv[1]}: missing embedded version {version}")
           PY
 
-      - name: Write manifest fragment
-        run: |
-          APP="dist/firmware-${{ matrix.name }}.bin"
-          MERGED="dist/merged-${{ matrix.name }}.bin"
-          APP_SHA=$(sha256sum "$APP" | cut -d" " -f1)
-          MERGED_SHA=$(sha256sum "$MERGED" | cut -d" " -f1)
-          MERGED_SIZE=$(stat -c%s "$MERGED")
-
-          cat > "dist/manifest-${{ matrix.name }}.json" <<EOF
-          {
-            "env": "${{ matrix.env }}",
-            "label": "${{ matrix.label }}",
-            "chip": "${{ matrix.chip }}",
-            "flashSize": "${{ matrix.flash_size }}",
-            "app": "firmware-${{ matrix.name }}.bin",
-            "appSha256": "${APP_SHA}",
-            "merged": "merged-${{ matrix.name }}.bin",
-            "mergedSha256": "${MERGED_SHA}",
-            "mergedSize": ${MERGED_SIZE}
-          }
-          EOF
-
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: firmware-${{ matrix.name }}
-          path: dist/*
-
-  release:
-    if: github.event_name != 'pull_request'
+  dispatch-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
     runs-on: ubuntu-latest
-    needs: [prepare, build]
     permissions:
-      contents: write
-
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
-
-      - name: Download all firmware artifacts
-        uses: actions/download-artifact@v6
         with:
-          path: dist
-          pattern: firmware-*
-          merge-multiple: true
-
-      - name: Assemble manifest.json
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag source and dispatch trusted publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          {
-            echo "{"
-            echo "  \"version\": \"${VERSION}\","
-            echo "  \"boards\": ["
-            FIRST=1
-            for f in $(find dist -maxdepth 1 -name 'manifest-*.json' | sort); do
-              if [ "$FIRST" -eq 0 ]; then echo "    ,"; fi
-              sed 's/^/    /' "$f"
-              FIRST=0
-            done
-            echo "  ]"
-            echo "}"
-          } > dist/manifest.json
-          rm -f dist/manifest-*.json
-          cat dist/manifest.json
+          set -euo pipefail
+          printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          test "v$(tr -d '[:space:]' < version.txt)" = "$VERSION"
+          TAG_COMMIT=$(git rev-parse "${VERSION}^{commit}")
+          test "$TAG_COMMIT" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$TAG_COMMIT" origin/main
+          ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          gh workflow run ci-release.yml --repo "$GITHUB_REPOSITORY" \
+            --ref main -f "release_tag=$VERSION"
 
-      - name: Validate release
+  release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on:
+      group: POG Release trusted
+      labels: pog-release-linux-x64
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.release_tag }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Validate immutable release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          test "v$(tr -d '[:space:]' < version.txt)" = "$VERSION"
+          TAG_COMMIT=$(git rev-parse "${VERSION}^{commit}")
+          test "$TAG_COMMIT" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$TAG_COMMIT" origin/main
+          ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          echo "SOURCE_COMMIT=$TAG_COMMIT" >> "$GITHUB_ENV"
+          echo "POGSENSOR_BUILD_VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: release-pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: release-pio-${{ runner.os }}-
+      - name: Install pinned PlatformIO
+        run: pip install platformio==6.1.19
+      - name: Rebuild every release image from the tag
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          while IFS='|' read -r NAME ENV CHIP FLASH LABEL; do
+            pio run -e "$ENV"
+            APP="dist/firmware-$NAME.bin"
+            MERGED="dist/merged-$NAME.bin"
+            cp ".pio/build/$ENV/firmware.bin" "$APP"
+            cp ".pio/build/$ENV/firmware.factory.bin" "$MERGED"
+            python3 - "$APP" <<'PY'
+          import os
+          import sys
+
+          version = os.environ["POGSENSOR_BUILD_VERSION"]
+          if f"POGSensor/{version}".encode() not in open(sys.argv[1], "rb").read():
+              raise SystemExit(f"{sys.argv[1]}: missing embedded version {version}")
+          PY
+            APP_SHA=$(sha256sum "$APP" | cut -d' ' -f1)
+            MERGED_SHA=$(sha256sum "$MERGED" | cut -d' ' -f1)
+            MERGED_SIZE=$(stat -c%s "$MERGED")
+            python3 - "$NAME" "$ENV" "$CHIP" "$FLASH" "$LABEL" \
+              "$APP_SHA" "$MERGED_SHA" "$MERGED_SIZE" <<'PY'
+          import json
+          import sys
+
+          name, env, chip, flash, label, app_sha, merged_sha, merged_size = sys.argv[1:]
+          fragment = {
+              "env": env,
+              "label": label,
+              "chip": chip,
+              "flashSize": flash,
+              "app": f"firmware-{name}.bin",
+              "appSha256": app_sha,
+              "merged": f"merged-{name}.bin",
+              "mergedSha256": merged_sha,
+              "mergedSize": int(merged_size),
+          }
+          with open(f"dist/manifest-{name}.json", "w", encoding="utf-8") as stream:
+              json.dump(fragment, stream, ensure_ascii=False, indent=2)
+          PY
+          done <<'BOARDS'
+          esp32c3|esp32c3|esp32c3|4MB|ESP32-C3 SuperMini (4 Mo)
+          esp32s3|esp32s3|esp32s3|8MB|ESP32-S3 DevKitC-1 (8 Mo)
+          esp32dev|esp32dev|esp32|4MB|ESP32 DevKit (4 Mo)
+          BOARDS
+      - name: Assemble and verify release
         run: |
           python3 - <<'PY'
           import hashlib
           import json
           import os
-          import re
-          import sys
+          from pathlib import Path
 
-          with open("dist/manifest.json", encoding="utf-8") as fh:
-              manifest = json.load(fh)
-
-          if not re.fullmatch(r"\d+\.\d+\.\d+", manifest.get("version", "")):
-              sys.exit("manifest.json: invalid semantic version")
-
-          boards = manifest.get("boards") or []
-          if not boards:
-              sys.exit("manifest.json declares no board")
-
-          seen = set()
+          boards = [json.loads(path.read_text()) for path in sorted(Path("dist").glob("manifest-*.json"))]
+          if len(boards) != 3:
+              raise SystemExit(f"expected 3 boards, found {len(boards)}")
           for board in boards:
-              required = (
-                  "env", "label", "chip", "flashSize", "app", "appSha256",
-                  "merged", "mergedSha256", "mergedSize",
-              )
-              for key in required:
-                  if board.get(key) in (None, ""):
-                      sys.exit(f"board {board.get('env', '?')}: missing {key}")
-              if board["env"] in seen:
-                  sys.exit(f"duplicate env {board['env']}")
-              seen.add(board["env"])
-
-              for asset_key, hash_key in (
-                  ("app", "appSha256"),
-                  ("merged", "mergedSha256"),
-              ):
-                  path = os.path.join("dist", board[asset_key])
-                  if not os.path.isfile(path):
-                      sys.exit(f"board {board['env']}: absent asset {board[asset_key]}")
-                  digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
-                  if digest != board[hash_key]:
-                      sys.exit(f"board {board['env']}: invalid {hash_key}")
-
-              merged_size = os.path.getsize(os.path.join("dist", board["merged"]))
-              if board["mergedSize"] != merged_size:
-                  sys.exit(
-                      f"board {board['env']}: mergedSize "
-                      f"{board['mergedSize']} != {merged_size}"
-                  )
-
-          print(f"manifest.json: {len(boards)} board(s), every asset verified")
+              for asset_key, hash_key in (("app", "appSha256"), ("merged", "mergedSha256")):
+                  path = Path("dist", board[asset_key])
+                  if hashlib.sha256(path.read_bytes()).hexdigest() != board[hash_key]:
+                      raise SystemExit(f"{path}: digest mismatch")
+              if Path("dist", board["merged"]).stat().st_size != board["mergedSize"]:
+                  raise SystemExit(f"{board['env']}: merged size mismatch")
+          manifest = {"version": os.environ["POGSENSOR_BUILD_VERSION"], "boards": boards}
+          Path("dist/manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+          for path in Path("dist").glob("manifest-*.json"):
+              path.unlink()
           PY
-
-      - name: Write SHA256SUMS
-        working-directory: dist
+          (cd dist && sha256sum *.bin manifest.json > SHA256SUMS)
+          cat dist/manifest.json
+          cat dist/SHA256SUMS
+      - name: Publish one immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_tag }}
         run: |
-          sha256sum *.bin manifest.json > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Update version.txt
-        if: needs.prepare.outputs.bumped == 'true'
-        run: |
-          echo "${{ needs.prepare.outputs.version }}" > version.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add version.txt
-          git commit -m "Bump version to ${{ needs.prepare.outputs.version }} [skip ci]"
-          git push
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.prepare.outputs.version }}
-          name: v${{ needs.prepare.outputs.version }}
-          files: |
-            dist/*.bin
-            dist/manifest.json
-            dist/SHA256SUMS
-          make_latest: true
-          generate_release_notes: true
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          gh release create "$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "POG OS Sensor $VERSION" --generate-notes
